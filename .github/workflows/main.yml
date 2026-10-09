@@ -1,0 +1,313 @@
+name: Remote Desktop
+on:
+  workflow_dispatch:
+    inputs:
+      ubuntu_latest:
+        description: 'Linux / Ubuntu latest (24.04 today) - label moves later'
+        type: boolean
+        default: false
+      ubuntu_24_04:
+        description: 'Linux / Ubuntu 24.04 - no end date yet'
+        type: boolean
+        default: true
+      ubuntu_22_04:
+        description: 'Linux / Ubuntu 22.04 - ends 17 Apr 2027'
+        type: boolean
+        default: false
+      ubuntu_26_04:
+        description: 'Linux / Ubuntu 26.04 (preview) - no end date yet'
+        type: boolean
+        default: false
+      ubuntu_24_04_arm:
+        description: 'Linux / Ubuntu 24.04 ARM64 - no end date yet'
+        type: boolean
+        default: false
+      ubuntu_22_04_arm:
+        description: 'Linux / Ubuntu 22.04 ARM64 - ends 17 Apr 2027'
+        type: boolean
+        default: false
+      ubuntu_26_04_arm:
+        description: 'Linux / Ubuntu 26.04 ARM64 (preview) - no end date yet'
+        type: boolean
+        default: false
+      windows_latest:
+        description: 'Windows / Server 2025 (latest) - no end date yet'
+        type: boolean
+        default: false
+      windows_2025:
+        description: 'Windows / Server 2025 (same machine as latest) - no end date yet'
+        type: boolean
+        default: false
+      windows_2022:
+        description: 'Windows / Server 2022 - no end date yet'
+        type: boolean
+        default: false
+      windows_11_arm:
+        description: 'Windows / 11 ARM64 - no end date yet'
+        type: boolean
+        default: false
+      macos_latest:
+        description: 'macOS / latest (26 today, Apple Silicon) - label moves later'
+        type: boolean
+        default: false
+      macos_26:
+        description: 'macOS / 26 Apple Silicon - no end date yet'
+        type: boolean
+        default: false
+      macos_15:
+        description: 'macOS / 15 Apple Silicon - no end date yet'
+        type: boolean
+        default: false
+      macos_14:
+        description: 'macOS / 14 Apple Silicon - ends 2 Nov 2026'
+        type: boolean
+        default: false
+      macos_26_intel:
+        description: 'macOS / 26 Intel - no end date yet'
+        type: boolean
+        default: false
+      macos_15_intel:
+        description: 'macOS / 15 Intel - no end date yet'
+        type: boolean
+        default: false
+permissions: {}
+jobs:
+  pick:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      os: ${{ steps.pick.outputs.os }}
+    steps:
+      - id: pick
+        shell: python
+        env:
+          INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          import json, os
+          labels = {
+              "ubuntu_latest": "ubuntu-latest",
+              "ubuntu_24_04": "ubuntu-24.04",
+              "ubuntu_22_04": "ubuntu-22.04",
+              "ubuntu_26_04": "ubuntu-26.04",
+              "ubuntu_24_04_arm": "ubuntu-24.04-arm",
+              "ubuntu_22_04_arm": "ubuntu-22.04-arm",
+              "ubuntu_26_04_arm": "ubuntu-26.04-arm",
+              "windows_latest": "windows-latest",
+              "windows_2025": "windows-2025",
+              "windows_2022": "windows-2022",
+              "windows_11_arm": "windows-11-arm",
+              "macos_latest": "macos-latest",
+              "macos_26": "macos-26",
+              "macos_15": "macos-15",
+              "macos_14": "macos-14",
+              "macos_26_intel": "macos-26-intel",
+              "macos_15_intel": "macos-15-intel",
+          }
+          ticked = json.loads(os.environ["INPUTS"])
+          picked = [labels[k] for k, v in ticked.items() if k in labels and v in (True, "true")] or ["ubuntu-24.04"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("os=" + json.dumps(picked) + "\n")
+  connect:
+    needs: pick
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.pick.outputs.os) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: ${{ startsWith(matrix.os, 'windows') && 'python' || 'python3 {0}' }}
+    env:
+      OS_LABEL: ${{ matrix.os }}
+      RUN_PASSWORD: ${{ secrets.RUN_PASSWORD }}
+      TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+      TS_OAUTH_CLIENT_SECRET: ${{ secrets.TS_OAUTH_CLIENT_SECRET }}
+    steps:
+      - name: desktop
+        run: |
+          import getpass, json, os, platform, re, shutil, socket, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request, zipfile
+          sys.stdout.reconfigure(line_buffering=True)
+          PW, CID, CSEC = (os.environ.pop(k, "") for k in ("RUN_PASSWORD", "TS_OAUTH_CLIENT_ID", "TS_OAUTH_CLIENT_SECRET"))
+          WIN, MAC = sys.platform == "win32", sys.platform == "darwin"
+          SUDO = [] if WIN else ["sudo"]
+          TMP = tempfile.gettempdir()
+          ALLOW = "100.64.0.0/10"
+          PORT = 21118
+          REL = "https://github.com/rustdesk/rustdesk/releases"
+          def fail(msg):
+              print("::error::" + msg)
+              sys.exit(1)
+          def get(*cmd, **kw):
+              try:
+                  return subprocess.run(cmd, capture_output=True, text=True, timeout=90, **kw).stdout.strip()
+              except subprocess.TimeoutExpired:
+                  return ""
+          def run(*cmd, **kw):
+              kw.setdefault("check", True)
+              return subprocess.run(cmd, **kw)
+          def bg(*cmd, env=None, log=os.devnull):
+              return subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=open(log, "ab"), stderr=subprocess.STDOUT, start_new_session=not WIN)
+          def wait(test, secs, what, why=lambda: ""):
+              end = time.time() + secs
+              while not test():
+                  if time.time() > end:
+                      fail("Timed out waiting for " + what + why())
+                  time.sleep(3)
+          def fetch(url, path):
+              try:
+                  with urllib.request.urlopen(url, timeout=120) as r, open(path, "wb") as f:
+                      shutil.copyfileobj(r, f)
+                  return True
+              except Exception as e:
+                  print(f"Download failed: {url} ({e})")
+                  return False
+          def api(path, data, headers):
+              try:
+                  with urllib.request.urlopen(urllib.request.Request("https://api.tailscale.com/api/v2/" + path, data=data, headers=headers), timeout=30) as r:
+                      return json.load(r)
+              except urllib.error.HTTPError as e:
+                  fail(f"Tailscale API {path} returned {e.code}: {e.read().decode()[:300]}")
+              except Exception as e:
+                  fail(f"Tailscale API {path} failed: {e}")
+          def listening(host):
+              try:
+                  socket.create_connection((host, PORT), timeout=3).close()
+                  return True
+              except OSError:
+                  return False
+          if len(PW) < 12 or not (CID and CSEC):
+              fail("Set the secrets RUN_PASSWORD (12+ characters), TS_OAUTH_CLIENT_ID and TS_OAUTH_CLIENT_SECRET")
+          token = api("oauth/token", urllib.parse.urlencode({"client_id": CID, "client_secret": CSEC}).encode(), {})["access_token"]
+          print("::add-mask::" + token)
+          try:
+              with urllib.request.urlopen(urllib.request.Request(REL + "/latest", method="HEAD"), timeout=30) as r:
+                  TAG = r.geturl().rstrip("/").rsplit("/", 1)[-1]
+          except Exception:
+              TAG = ""
+          if not re.fullmatch(r"\d+\.\d+\.\d+", TAG):
+              TAG = "1.5.0"
+          print("RustDesk " + TAG)
+          DL = f"{REL}/download/{TAG}/rustdesk-{TAG}-"
+          ARM = (os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE") or platform.machine()).lower() in ("arm64", "aarch64")
+          ARCH = "aarch64" if ARM else "x86_64"
+          if WIN:
+              exe = os.path.join(TMP, "rustdesk-setup.exe")
+              fetch(f"{DL}{ARCH}.exe", exe) or fail("Could not download RustDesk")
+              subprocess.Popen([exe, "--silent-install"])
+              RD = [os.path.join(os.environ.get("ProgramW6432") or os.environ["ProgramFiles"], "RustDesk", "rustdesk.exe")]
+              try:
+                  z, d = os.path.join(TMP, "vbcable.zip"), os.path.join(TMP, "vbcable")
+                  if not fetch("https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip", z):
+                      raise RuntimeError("download failed")
+                  with zipfile.ZipFile(z) as zf:
+                      zf.extractall(d)
+                      setup = os.path.join(d, next(n for n in zf.namelist() if n.lower().endswith(".exe") and ("arm64" if ARM else "x64") in n.lower()))
+                  trust = f"$g = Get-AuthenticodeSignature '{setup}'; if ($g.Status -ne 'Valid' -or $g.SignerCertificate.Subject -notmatch 'VB.?Audio|Burel') {{ exit 1 }}; Start-Service audiosrv; $s = New-Object Security.Cryptography.X509Certificates.X509Store 'TrustedPublisher','LocalMachine'; $s.Open('ReadWrite'); Get-ChildItem '{d}' -Recurse -Include *.cat,*.exe | ForEach-Object {{ $c = (Get-AuthenticodeSignature $_.FullName).SignerCertificate; if ($c) {{ $s.Add($c) }} }}; $s.Close()"
+                  if run("powershell", "-NoProfile", "-Command", trust, check=False).returncode:
+                      raise RuntimeError("installer signature check failed")
+                  run(setup, "-i", "-h", timeout=180, check=False)
+                  print("Sound devices: " + get("powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_SoundDevice).Name").replace("\n", ", "))
+              except Exception as e:
+                  print(f"::warning::No virtual sound card, so no sound ({str(e) or 'no installer for this CPU'})")
+          elif MAC:
+              dmg, mnt = os.path.join(TMP, "rustdesk.dmg"), os.path.join(TMP, "rustdesk-dmg")
+              app = "/Applications/RustDesk.app"
+              fetch(f"{DL}{ARCH}.dmg", dmg) or fail("Could not download RustDesk")
+              os.makedirs(mnt, exist_ok=True)
+              run("hdiutil", "attach", dmg, "-nobrowse", "-quiet", "-mountpoint", mnt, input="Y\n", text=True)
+              run("sudo", "ditto", mnt + "/RustDesk.app", app)
+              run("hdiutil", "detach", mnt, "-quiet", check=False)
+              bid = get("defaults", "read", app + "/Contents/Info", "CFBundleIdentifier") or "com.carriez.rustdesk"
+              for svc in ("kTCCServiceScreenCapture", "kTCCServiceAccessibility", "kTCCServicePostEvent", "kTCCServiceListenEvent"):
+                  sql = f"INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('{svc}', '{bid}', 0, 2, 4, 1);"
+                  if run("sudo", "sqlite3", "/Library/Application Support/com.apple.TCC/TCC.db", sql, check=False).returncode:
+                      fail("Could not grant the screen permissions (TCC) - this macOS image may block it")
+              bg("caffeinate", "-dimsu")
+              run("open", app)
+              RD = [app + "/Contents/MacOS/RustDesk"]
+          else:
+              user = getpass.getuser()
+              fetch(f"{DL}{ARCH}.deb", "/tmp/rustdesk.deb") or fail("Could not download RustDesk")
+              run("sudo", "apt-get", "-o", "Acquire::Retries=3", "update")
+              run("sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "Acquire::Retries=3", "install", "-y", "xvfb", "xfce4", "dbus-x11", "ufw", "/tmp/rustdesk.deb")
+              run("sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "--no-install-recommends", "pulseaudio", check=False)
+              run("sudo", "systemctl", "disable", "--now", "rustdesk", check=False)
+              run("sudo", "chpasswd", input=f"{user}:{PW}\n", text=True)
+              run("sudo", "install", "-d", "-m", "1777", "/tmp/.X11-unix")
+              xfconf = os.path.expanduser("~/.config/xfce4/xfconf/xfce-perchannel-xml")
+              os.makedirs(xfconf, exist_ok=True)
+              with open(xfconf + "/xfwm4.xml", "w") as f:
+                  f.write('<?xml version="1.0" encoding="UTF-8"?>\n<channel name="xfwm4" version="1.0">\n  <property name="general" type="empty">\n    <property name="use_compositing" type="bool" value="false"/>\n  </property>\n</channel>\n')
+              pulse = "/tmp/pulse-" + user
+              os.makedirs(pulse, mode=0o700, exist_ok=True)
+              env = {"PATH": os.environ["PATH"], "HOME": os.path.expanduser("~"), "USER": user, "LOGNAME": user, "SHELL": "/bin/bash", "LANG": "C.UTF-8", "DISPLAY": ":99", "PULSE_RUNTIME_PATH": pulse, "XDG_CONFIG_DIRS": "/etc:/etc/xdg", "XDG_CURRENT_DESKTOP": "XFCE", "XDG_SESSION_DESKTOP": "xfce", "DESKTOP_SESSION": "xfce"}
+              bg("Xvfb", ":99", "-screen", "0", "1280x720x24", "-nolisten", "tcp", env=env, log="/tmp/xvfb.log")
+              wait(lambda: os.path.exists("/tmp/.X11-unix/X99"), 30, "the virtual screen")
+              if shutil.which("pulseaudio"):
+                  run("pulseaudio", "--start", "--exit-idle-time=-1", env=env, check=False)
+              desk = bg("startxfce4", env=env, log="/tmp/xfce.log")
+              bg("rustdesk", "--server", env=env, log="/tmp/rustdesk.log")
+              RD = ["/usr/bin/rustdesk"]
+          if WIN:
+              arch = "arm64" if ARM else "amd64"
+              base = "https://pkgs.tailscale.com/stable/"
+              msi = os.path.join(TMP, "tailscale.msi")
+              if not fetch(f"{base}tailscale-setup-latest-{arch}.msi", msi):
+                  page = urllib.request.urlopen(base, timeout=30).read().decode()
+                  fetch(base + re.search(rf"tailscale-setup-[0-9.]+-{arch}\.msi", page).group(0), msi) or fail("Could not download Tailscale")
+              sig = get("powershell", "-NoProfile", "-Command", f"$s = Get-AuthenticodeSignature '{msi}'; $s.Status; $s.SignerCertificate.Subject")
+              if not sig.startswith("Valid") or "Tailscale" not in sig:
+                  fail("Tailscale installer signature check failed: " + sig)
+              if run("msiexec", "/i", msi, "/quiet", "/norestart", check=False).returncode not in (0, 3010):
+                  fail("Tailscale installation failed")
+              run("powershell", "-NoProfile", "-Command", "Start-Service Tailscale", check=False)
+              TS = [p for p in (os.path.join(d, "Tailscale", "tailscale.exe") for d in (os.environ.get("ProgramFiles"), os.environ.get("ProgramW6432"), os.environ.get("ProgramFiles(x86)")) if d) if os.path.exists(p)][:1] or fail("tailscale.exe not found")
+          elif MAC:
+              run("brew", "install", "tailscale")
+              bg("sudo", "tailscaled")
+              wait(lambda: os.path.exists("/var/run/tailscaled.socket"), 60, "tailscaled")
+              TS = ["tailscale"]
+          else:
+              fetch("https://tailscale.com/install.sh", "/tmp/tailscale-install.sh") or fail("Could not download Tailscale")
+              run("sh", "/tmp/tailscale-install.sh")
+              TS = ["tailscale"]
+          NAME = "gh-" + os.environ["OS_LABEL"].replace(".", "-") + "-" + os.environ.get("GITHUB_RUN_ID", "0")
+          key = api("tailnet/-/keys", json.dumps({"capabilities": {"devices": {"create": {"reusable": False, "ephemeral": True, "preauthorized": True, "tags": ["tag:ci"]}}}, "expirySeconds": 600}).encode(), {"Authorization": "Bearer " + token, "Content-Type": "application/json"})["key"]
+          print("::add-mask::" + key)
+          def ts(*args):
+              return get(*SUDO, *TS, *args)
+          def rd(*args):
+              return get(*SUDO, *RD, *args)
+          run(*SUDO, *TS, "up", "--authkey=" + key, "--hostname=" + NAME, "--timeout=120s", *(["--unattended"] if WIN else []))
+          wait(lambda: ts("ip", "-4"), 90, "a Tailscale address")
+          IP = ts("ip", "-4").splitlines()[0]
+          wait(lambda: os.path.exists(RD[0]), 300, "RustDesk to finish installing")
+          wait(lambda: "Done!" in rd("--password", PW), 300, "RustDesk to accept the password", lambda: " - RustDesk said: " + (rd("--password", PW) or "nothing"))
+          opts = [("direct-server", "Y"), ("whitelist", ALLOW), ("verification-method", "use-permanent-password"), ("approve-mode", "password"), ("allow-hide-cm", "Y")]
+          if WIN:
+              opts += [("enable-directx-capture", "N"), ("enable-hwcodec", "N")]
+          for k, v in opts:
+              rd("--option", k, v)
+          if WIN:
+              print(get("netsh", "advfirewall", "firewall", "set", "rule", "name=RustDesk Service", "dir=in", "new", "remoteip=" + ALLOW))
+              r = run("powershell", "-NoProfile", "-Command", "New-LocalUser -Name run -Password (ConvertTo-SecureString $env:RUN_PASSWORD -AsPlainText -Force) -AccountNeverExpires | Out-Null; Add-LocalGroupMember -Group Administrators -Member run", env={**os.environ, "RUN_PASSWORD": PW}, capture_output=True, text=True, check=False)
+              if r.returncode:
+                  print("::warning::Could not create the run login: " + r.stderr.strip()[:200])
+          elif not MAC:
+              if run("sudo", "ufw", "allow", "from", ALLOW, "to", "any", "port", str(PORT), "proto", "tcp", check=False).returncode or run("sudo", "ufw", "--force", "enable", check=False).returncode:
+                  print("::warning::The firewall could not be enabled - RustDesk still accepts only Tailscale addresses with your password")
+          wait(lambda: rd("--option", "direct-server") == "Y" and listening(IP), 90, f"RustDesk to listen on port {PORT}")
+          print("=" * 44)
+          print("READY  " + IP)
+          print("Turn on Tailscale on your PC, then RustDesk > enter the address above > password = your RUN_PASSWORD secret")
+          print("=" * 44)
+          while True:
+              print(time.strftime("[%H:%M:%S] active"))
+              print("\n".join(l for l in ts("status").splitlines() if "active;" in l))
+              if not listening(IP):
+                  print(f"::warning::RustDesk is not answering on port {PORT}")
+              if not (WIN or MAC) and desk.poll() is not None:
+                  print("::warning::The desktop stopped:\n" + open("/tmp/xfce.log").read()[-1500:])
+              time.sleep(60)
