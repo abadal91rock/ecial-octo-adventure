@@ -234,36 +234,51 @@ jobs:
                   if run("sudo", "sqlite3", "/Library/Application Support/com.apple.TCC/TCC.db", sql, check=False).returncode:
                       fail("Could not grant the screen permissions (TCC) - this macOS image may block it")
               bg("caffeinate", "-dimsu")
+              if run("sudo", "sysadminctl", "-addUser", "run", "-fullName", "run", "-password", PW, "-admin", capture_output=True, check=False).returncode:
+                  print("::warning::Could not create the run login")
+              if run("sudo", "dscl", ".", "-passwd", "/Users/" + getpass.getuser(), PW, capture_output=True, check=False).returncode:
+                  print("::warning::Could not set the password of the account shown on screen, so macOS password boxes may not accept your password")
               run("open", app)
               pics = sorted(glob.glob("/System/Library/Desktop Pictures/*.heic"))
               if pics:
                   get("osascript", "-e", f'tell application "System Events" to tell every desktop to set picture to "{pics[0]}"')
               RD = [app + "/Contents/MacOS/RustDesk"]
           else:
-              user = getpass.getuser()
+              user = "run"
+              os.chdir("/")
               fetch(f"{DL}{ARCH}.deb", "/tmp/rustdesk.deb") or fail("Could not download RustDesk")
               run("sudo", "apt-get", "-o", "Acquire::Retries=3", "update")
-              run("sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "Acquire::Retries=3", "install", "-y", "--no-install-recommends", "xvfb", "xfonts-base", "libgl1-mesa-dri", "cinnamon", "gnome-terminal", "librsvg2-common", "adwaita-icon-theme", "ufw", "/tmp/rustdesk.deb")
+              run("sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-o", "Acquire::Retries=3", "install", "-y", "--no-install-recommends", "xvfb", "xfonts-base", "fonts-noto-core", "fonts-noto-cjk", "fonts-noto-color-emoji", "libgl1-mesa-dri", "cinnamon", "gnome-terminal", "gnome-disk-utility", "librsvg2-common", "adwaita-icon-theme", "gnome-backgrounds", "pysassc", "ufw", "/tmp/rustdesk.deb")
               run("sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "--no-install-recommends", "pulseaudio", check=False)
               run("sudo", "systemctl", "disable", "--now", "rustdesk", check=False)
+              for repo, ref in (("mint-themes", "b1dfbc54992cdcc8cb0c64e9bf5ac44d69ef9709"), ("mint-y-icons", "545eda37945206062c1814fc9a99efbe69e6bcd1")):
+                  fetch(f"https://github.com/linuxmint/{repo}/archive/{ref}.tar.gz", f"/tmp/{repo}.tgz") or fail("Could not download " + repo)
+                  os.makedirs("/tmp/" + repo, exist_ok=True)
+                  run("tar", "-xzf", f"/tmp/{repo}.tgz", "-C", "/tmp/" + repo, "--strip-components=1", "--exclude=*/Mint-X/variations/*", "--exclude=*/Mint-Y/variations/[!A]*")
+              run("python3", "generate-themes.py", cwd="/tmp/mint-themes", stdout=subprocess.DEVNULL)
+              run("sudo", "cp", "-R", *("/tmp/mint-themes/usr/share/themes/" + n for n in ("Mint-Y", "Mint-Y-Aqua", "Mint-Y-Dark-Aqua")), "/usr/share/themes/")
+              run("sudo", "cp", "-R", *("/tmp/mint-y-icons/usr/share/icons/" + n for n in ("Mint-Y", "Mint-Y-Sand")), "/usr/share/icons/")
+              run("sudo", "gtk-update-icon-cache", "-q", "-f", "/usr/share/icons/Mint-Y", check=False)
+              run("sudo", "useradd", "-m", "-s", "/bin/bash", "-G", "sudo", user)
               run("sudo", "chpasswd", input=f"{user}:{PW}\n", text=True)
               run("sudo", "install", "-d", "-m", "1777", "/tmp/.X11-unix")
               pulse, xdg = "/tmp/pulse-" + user, "/tmp/xdg-" + user
-              for d in (pulse, xdg):
-                  os.makedirs(d, mode=0o700, exist_ok=True)
-              env = {"PATH": os.environ["PATH"], "HOME": os.path.expanduser("~"), "USER": user, "LOGNAME": user, "SHELL": "/bin/bash", "LANG": "C.UTF-8", "DISPLAY": ":99", "PULSE_RUNTIME_PATH": pulse, "XDG_RUNTIME_DIR": xdg, "XDG_SESSION_TYPE": "x11", "LIBGL_ALWAYS_SOFTWARE": "1", "CLUTTER_DEFAULT_FPS": "30"}
-              bg("Xvfb", ":99", "-screen", "0", "1280x720x24", "-nolisten", "tcp", env=env, log="/tmp/xvfb.log")
+              run("sudo", "install", "-d", "-o", user, "-m", "700", pulse, xdg)
+              env = {"PATH": os.environ["PATH"], "HOME": "/home/" + user, "USER": user, "LOGNAME": user, "SHELL": "/bin/bash", "LANG": "C.UTF-8", "DISPLAY": ":99", "PULSE_RUNTIME_PATH": pulse, "XDG_RUNTIME_DIR": xdg, "XDG_SESSION_TYPE": "x11", "LIBGL_ALWAYS_SOFTWARE": "1", "CLUTTER_DEFAULT_FPS": "30"}
+              def as_user(*cmd):
+                  return ["sudo", "-u", user, "env", *(f"{k}={v}" for k, v in env.items()), *cmd]
+              bg(*as_user("Xvfb", ":99", "-screen", "0", "1280x720x24", "-nolisten", "tcp"), log="/tmp/xvfb.log")
               wait(lambda: os.path.exists("/tmp/.X11-unix/X99"), 30, "the virtual screen")
               if shutil.which("pulseaudio"):
-                  run("pulseaudio", "--start", "--exit-idle-time=-1", env=env, check=False)
+                  run(*as_user("pulseaudio", "--start", "--exit-idle-time=-1"), check=False)
               else:
                   print("::warning::PulseAudio could not be installed, so no sound")
-              env["DBUS_SESSION_BUS_ADDRESS"] = get("dbus-daemon", "--session", "--fork", "--print-address", env=env) or fail("Could not start the desktop message bus")
+              env["DBUS_SESSION_BUS_ADDRESS"] = get(*as_user("dbus-daemon", "--session", "--fork", "--print-address")) or fail("Could not start the desktop message bus")
               wall = "".join(glob.glob("/usr/share/backgrounds/gnome/adwaita-d.*")[:1])
-              for schema, key, value in (("org.cinnamon.desktop.background", "picture-uri", f"'file://{wall}'"), ("org.cinnamon.desktop.interface", "icon-theme", "'Adwaita'"), ("org.cinnamon.desktop.session", "idle-delay", "0"), ("org.cinnamon.desktop.screensaver", "lock-enabled", "false"), ("org.cinnamon.muffin", "unredirect-fullscreen-windows", "true"), ("org.cinnamon.desktop.notifications", "display-notifications", "false")):
-                  get("gsettings", "set", schema, key, value, env=env)
-              desk = bg("cinnamon-session-cinnamon", env=env, log="/tmp/cinnamon.log")
-              bg("rustdesk", "--server", env=env, log="/tmp/rustdesk.log")
+              for schema, key, value in (("org.cinnamon.desktop.background", "picture-uri", f"'file://{wall}'"), ("org.cinnamon.desktop.interface", "gtk-theme", "'Mint-Y-Aqua'"), ("org.cinnamon.desktop.interface", "icon-theme", "'Mint-Y-Sand'"), ("org.cinnamon.desktop.wm.preferences", "theme", "'Mint-Y'"), ("org.cinnamon.desktop.wm.preferences", "button-layout", "':minimize,maximize,close'"), ("org.cinnamon.theme", "name", "'Mint-Y-Dark-Aqua'"), ("org.cinnamon.desktop.session", "idle-delay", "0"), ("org.cinnamon.desktop.screensaver", "lock-enabled", "false"), ("org.cinnamon.muffin", "unredirect-fullscreen-windows", "true"), ("org.cinnamon.desktop.notifications", "display-notifications", "false")):
+                  get(*as_user("gsettings", "set", schema, key, value))
+              desk = bg(*as_user("cinnamon-session-cinnamon"), log="/tmp/cinnamon.log")
+              bg(*as_user("rustdesk", "--server"), log="/tmp/rustdesk.log")
               RD = ["/usr/bin/rustdesk"]
           if WIN:
               arch = "arm64" if ARM else "amd64"
@@ -313,12 +328,16 @@ jobs:
           elif not MAC:
               if run("sudo", "ufw", "allow", "from", ALLOW, "to", "any", "port", str(PORT), "proto", "tcp", check=False).returncode or run("sudo", "ufw", "--force", "enable", check=False).returncode:
                   print("::warning::The firewall could not be enabled - RustDesk still accepts only Tailscale addresses with your password")
-              wait(lambda: get("gdbus", "call", "--session", "--dest", "org.Cinnamon", "--object-path", "/org/Cinnamon", "--method", "org.Cinnamon.GetRunState", env=env) == "(2,)", 180, "the desktop to start", lambda: ":\n" + open("/tmp/cinnamon.log").read()[-2000:])
-              get("gsettings", "set", "org.cinnamon.desktop.notifications", "display-notifications", "true", env=env)
+              nic = re.search(r"dev (\S+)", get("sudo", "ip", "route", "show", "default"))
+              if nic:
+                  run("sudo", "nmcli", "device", "set", nic.group(1), "managed", "yes", check=False)
+              wait(lambda: get(*as_user("gdbus", "call", "--session", "--dest", "org.Cinnamon", "--object-path", "/org/Cinnamon", "--method", "org.Cinnamon.GetRunState")) == "(2,)", 180, "the desktop to start", lambda: ":\n" + open("/tmp/cinnamon.log").read()[-2000:])
+              get(*as_user("gsettings", "set", "org.cinnamon.desktop.notifications", "display-notifications", "true"))
           wait(lambda: rd("--option", "direct-server") == "Y" and listening(IP), 90, f"RustDesk to listen on port {PORT}")
           print("=" * 44)
           print("READY  " + IP)
           print("Turn on Tailscale on your PC, then RustDesk > enter the address above > password = your RUN_PASSWORD secret")
+          print("The same password works in every password box on the runner (sudo, Open Anyway, installers)")
           print("Laggy? Top bar > Display > Image Quality: Optimize reaction time, Codec: VP8. Sound off: Display > Mute")
           print("=" * 44)
           while True:
