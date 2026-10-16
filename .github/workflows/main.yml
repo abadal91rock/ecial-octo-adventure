@@ -55,7 +55,7 @@ jobs:
     steps:
       - name: cluster
         run: |
-          import ctypes, json, os, shutil, socket, socketserver, subprocess, sys, tempfile, threading, time, urllib.error, urllib.parse, urllib.request, zipfile
+          import ctypes, errno, json, os, shutil, socket, socketserver, subprocess, sys, tempfile, threading, time, urllib.error, urllib.parse, urllib.request, zipfile
           sys.stdout.reconfigure(line_buffering=True, errors="replace")
           CID, CSEC = (os.environ.pop(k, "") for k in ("TS_OAUTH_CLIENT_ID", "TS_OAUTH_CLIENT_SECRET"))
           NODE, WORKERS, MINUTES = (int(os.environ[k]) for k in ("NODE", "WORKERS", "MINUTES"))
@@ -63,7 +63,9 @@ jobs:
           HEAD = NODE == 0
           TAG = "b11612"
           ALLOW = "100.64.0.0/10"
-          CTL, RPC, API = 5201, 50052, 8080
+          CTLS = [5201, 15201, 25201, 35201, 45201]
+          RPCS = [15052, 25052, 35052, 45052, 5052]
+          APIS = [8080, 18080, 28080, 38080, 48080]
           MODELS = {
               "qwen3-30b-a3b": ("https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf", 18556685824),
               "gpt-oss-120b": ("https://huggingface.co/ggml-org/gpt-oss-120b-GGUF/resolve/main/gpt-oss-120b-MXFP4.gguf", 63387346208),
@@ -76,6 +78,8 @@ jobs:
           STOP = threading.Event()
           SEEN = [0.0]
           WIPS = []
+          PORT = {}
+          RP = 0
           def fail(msg):
               print("::error::" + msg)
               sys.exit(1)
@@ -93,7 +97,10 @@ jobs:
               return subprocess.run(cmd, **kw)
           def wait(test, secs, what, why=lambda: ""):
               end = time.time() + secs
-              while not test():
+              while True:
+                  value = test()
+                  if value:
+                      return value
                   if time.time() > end:
                       fail("Timed out waiting for " + what + why())
                   time.sleep(3)
@@ -128,12 +135,40 @@ jobs:
                   fail(f"Tailscale API {path} returned {e.code}: {e.read().decode()[:300]}")
               except Exception as e:
                   fail(f"Tailscale API {path} failed: {e}")
-          def listening(host, port):
+          def taken(ip, port):
+              s = socket.socket()
               try:
-                  socket.create_connection((host, port), timeout=3).close()
-                  return True
-              except OSError:
+                  s.bind((ip, port))
                   return False
+              except OSError as e:
+                  return e.errno == errno.EADDRINUSE or getattr(e, "winerror", 0) == 10048
+              finally:
+                  s.close()
+          def pick(ports):
+              for p in ports:
+                  if taken(IP, p):
+                      say(f"port {p} is already in use")
+                      continue
+                  s = socket.socket()
+                  try:
+                      s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                      s.bind((IP, p))
+                      s.listen(1)
+                      return p
+                  except OSError as e:
+                      say(f"port {p} is not usable here: {e}")
+                  finally:
+                      s.close()
+              return 0
+          def find(ip):
+              for p in CTLS:
+                  PORT[ip] = p
+                  try:
+                      if ask(ip, b"PING", 3) == "PONG":
+                          return True
+                  except OSError:
+                      pass
+              return False
           class MemStatus(ctypes.Structure):
               _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [(n, ctypes.c_ulonglong) for n in ("total", "avail", "pf_total", "pf_avail", "v_total", "v_avail", "v_ext")]
           def ram():
@@ -144,7 +179,7 @@ jobs:
           def ts(*args):
               return get(*TS, *args)
           def ask(ip, line, timeout=30):
-              with socket.create_connection((ip, CTL), timeout=timeout) as s:
+              with socket.create_connection((ip, PORT[ip]), timeout=timeout) as s:
                   s.sendall(line + b"\n")
                   return s.makefile("rb").readline().decode().strip()
           class Ctl(socketserver.StreamRequestHandler):
@@ -159,6 +194,8 @@ jobs:
                           self.wfile.write(b"PONG\n")
                       elif parts[0] == b"MEM":
                           self.wfile.write(f"{ram()[0]}\n".encode())
+                      elif parts[0] == b"RPC":
+                          self.wfile.write(f"{RP}\n".encode())
                       elif parts[0] == b"SINK":
                           while self.rfile.read(1 << 20):
                               pass
@@ -168,9 +205,10 @@ jobs:
                           STOP.set()
                           return
           class Server(socketserver.ThreadingTCPServer):
+              allow_reuse_address = True
               daemon_threads = True
           def latency(ip, n=200):
-              with socket.create_connection((ip, CTL), timeout=30) as s:
+              with socket.create_connection((ip, PORT[ip]), timeout=30) as s:
                   s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                   f = s.makefile("rb")
                   ms = []
@@ -183,7 +221,7 @@ jobs:
               return ms[0], ms[n // 2], ms[int(n * 0.95)]
           def upload(ip, secs=10):
               block = bytes(1 << 20)
-              with socket.create_connection((ip, CTL), timeout=120) as s:
+              with socket.create_connection((ip, PORT[ip]), timeout=120) as s:
                   s.sendall(b"SINK\n")
                   t = time.perf_counter()
                   mb = 0
@@ -195,11 +233,11 @@ jobs:
                   return mb * 8.388608 / (time.perf_counter() - t)
           def chat(prompt, tokens):
               body = json.dumps({"messages": [{"role": "user", "content": prompt}], "max_tokens": tokens, "temperature": 0, "cache_prompt": False}).encode()
-              with urllib.request.urlopen(urllib.request.Request(f"http://{IP}:{API}/v1/chat/completions", data=body, headers={"Content-Type": "application/json"}), timeout=1800) as r:
+              with urllib.request.urlopen(urllib.request.Request(f"http://{IP}:{AP}/v1/chat/completions", data=body, headers={"Content-Type": "application/json"}), timeout=1800) as r:
                   return json.load(r)
           def healthy():
               try:
-                  with urllib.request.urlopen(f"http://{IP}:{API}/health", timeout=5) as r:
+                  with urllib.request.urlopen(f"http://{IP}:{AP}/health", timeout=5) as r:
                       return r.status == 200
               except Exception:
                   return False
@@ -235,7 +273,8 @@ jobs:
           IP = ts("ip", "-4").splitlines()[0]
           print(f"Tailscale address {IP} as {NAMES[NODE]}")
           print(ts("netcheck"))
-          print(get("netsh", "advfirewall", "firewall", "add", "rule", "name=llm-cluster", "dir=in", "action=allow", "protocol=TCP", f"localport={CTL},{RPC},{API}", "remoteip=" + ALLOW))
+          print(get("netsh", "int", "ipv4", "show", "excludedportrange", "protocol=tcp"))
+          print(get("netsh", "advfirewall", "firewall", "add", "rule", "name=llm-cluster", "dir=in", "action=allow", "protocol=TCP", "localport=" + ",".join(str(p) for p in CTLS + RPCS + APIS), "remoteip=" + ALLOW))
           zip_path = os.path.join(WORK, "llama.zip")
           fetch(f"https://github.com/ggml-org/llama.cpp/releases/download/{TAG}/llama-{TAG}-bin-win-cpu-x64.zip", zip_path) or fail("Could not download llama.cpp " + TAG)
           with zipfile.ZipFile(zip_path) as z:
@@ -243,13 +282,27 @@ jobs:
           for exe in ("ggml-rpc-server.exe", "llama-server.exe"):
               os.path.exists(os.path.join(BIN, exe)) or fail(exe + " is not in the llama.cpp download")
           if not HEAD:
-              rpc = subprocess.Popen([os.path.join(BIN, "ggml-rpc-server.exe"), "-H", IP, "-p", str(RPC)], cwd=BIN)
+              rpc = None
               try:
-                  wait(lambda: rpc.poll() is not None or listening(IP, RPC), 60, "the RPC server to start")
-                  rpc.poll() is None or fail(f"The RPC server stopped with code {rpc.returncode}")
-                  ctl = Server((IP, CTL), Ctl)
+                  for RP in RPCS:
+                      rpc = subprocess.Popen([os.path.join(BIN, "ggml-rpc-server.exe"), "-H", IP, "-p", str(RP)], cwd=BIN)
+                      began = time.time()
+                      wait(lambda: rpc.poll() is not None or taken(IP, RP) or time.time() - began > 15, 60, "the RPC server to start")
+                      if rpc.poll() is None:
+                          break
+                      say(f"The RPC server stopped with code {rpc.returncode} on port {RP}, trying the next port")
+                  else:
+                      fail("The RPC server could not start on any port, see the lines above")
+                  for CP in CTLS:
+                      try:
+                          ctl = Server((IP, CP), Ctl)
+                          break
+                      except OSError as e:
+                          say(f"port {CP} is not usable here: {e}")
+                  else:
+                      fail("No usable control port")
                   threading.Thread(target=ctl.serve_forever, daemon=True).start()
-                  say("READY as a worker, waiting for the head")
+                  say(f"READY as a worker, RPC port {RP}, control port {CP}, waiting for the head")
                   started = time.time()
                   while not STOP.is_set():
                       rpc.poll() is None or fail(f"The RPC server stopped with code {rpc.returncode}, free RAM {gb(ram()[0])}")
@@ -259,15 +312,16 @@ jobs:
                       STOP.wait(60)
                   print("The head is finished, shutting down")
               finally:
-                  rpc.terminate()
+                  if rpc is not None:
+                      rpc.terminate()
               sys.exit(0)
           srv = None
           try:
               for i in range(1, WORKERS + 1):
-                  wait(lambda: ts("ip", "-4", NAMES[i]), 900, f"worker {i} to join Tailscale")
+                  wait(lambda: ts("ip", "-4", NAMES[i]), 900, f"worker {i} to join Tailscale", lambda: " - if that worker is running, check that the Tailscale access rules let tag:ci reach tag:ci")
                   WIPS.append(ts("ip", "-4", NAMES[i]).splitlines()[0])
               for i, ip in enumerate(WIPS, 1):
-                  wait(lambda: listening(ip, CTL), 900, f"worker {i} ({ip}) to be ready", lambda: " - check the Tailscale access rules: tag:ci to tag:ci on TCP 5201 and 50052")
+                  wait(lambda: find(ip), 900, f"worker {i} ({ip}) to be ready", lambda: " - check the Tailscale access rules: tag:ci to tag:ci on all ports")
               def pulse():
                   while True:
                       time.sleep(60)
@@ -295,7 +349,8 @@ jobs:
               t0 = time.time()
               fetch(URL, model, SIZE) or fail("Could not download the model")
               say(f"model downloaded in {(time.time() - t0) / 60:.1f} min")
-              srv = subprocess.Popen([os.path.join(BIN, "llama-server.exe"), "-m", model, "--rpc", ",".join(f"{ip}:{RPC}" for ip in WIPS), "--host", IP, "--port", str(API), "-c", "8192", "-np", "1", "-cram", "0", "-fitt", "1536", "-lv", "4"], cwd=BIN)
+              AP = wait(lambda: pick(APIS), 30, "a usable port for the web server")
+              srv = subprocess.Popen([os.path.join(BIN, "llama-server.exe"), "-m", model, "--rpc", ",".join(f"{ip}:{ask(ip, b'RPC')}" for ip in WIPS), "--host", IP, "--port", str(AP), "-c", "8192", "-np", "1", "-cram", "0", "-fitt", "1536", "-lv", "4"], cwd=BIN)
               beat = [0.0]
               def loaded():
                   srv.poll() is None or fail(f"llama-server stopped with code {srv.returncode}, see the log lines above")
@@ -313,9 +368,9 @@ jobs:
                   print(f"SELFTEST  prompt {t['prompt_n']} tokens at {t['prompt_per_second']:.1f} tokens/s, answer {t['predicted_n']} tokens at {t['predicted_per_second']:.2f} tokens/s")
                   print("  " + (m.get("content") or m.get("reasoning_content") or "")[:150].replace("\n", " "))
               print("=" * 44)
-              print(f"READY  http://{IP}:{API}")
+              print(f"READY  http://{IP}:{AP}")
               print("Turn on Tailscale on your PC, then open the address above in a browser to chat")
-              print(f"Other apps can use it as an OpenAI-style API at http://{IP}:{API}/v1")
+              print(f"Other apps can use it as an OpenAI-style API at http://{IP}:{AP}/v1")
               print(f"It stays up for {MINUTES} minutes. To stop earlier, cancel the workflow run")
               print("=" * 44)
               until = time.time() + MINUTES * 60
