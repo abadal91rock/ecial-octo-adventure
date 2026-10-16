@@ -5,8 +5,8 @@ on:
       workers:
         description: 'Worker runners next to the head (1 = 2 runners in total, 5 = 6 runners)'
         type: choice
-        options: ['1', '2', '3', '4', '5', '6', '7']
-        default: '1'
+        options: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20']
+        default: '20'
       model:
         description: 'qwen3-30b-a3b = 18 GB test model, gpt-oss-120b = 63 GB model (needs 5 or more workers)'
         type: choice
@@ -15,8 +15,8 @@ on:
       minutes:
         description: 'Minutes to keep the model running once it is ready'
         type: choice
-        options: ['30', '60', '120', '180']
-        default: '60'
+        options: ['30', '60', '120', '180', '360']
+        default: '360'
 permissions: {}
 jobs:
   pick:
@@ -40,7 +40,7 @@ jobs:
     strategy:
       matrix:
         node: ${{ fromJSON(needs.pick.outputs.nodes) }}
-    runs-on: windows-2025
+    runs-on: windows-2022
     timeout-minutes: 350
     defaults:
       run:
